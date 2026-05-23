@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatGPT Icon 3D Preview</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0d1117;
+      --panel: rgba(13, 17, 23, 0.86);
+      --text: #ecf2f8;
+      --muted: #9ba7b4;
+      --ok: #10a37f;
+      --error: #ff6b6b;
+      --line: rgba(255, 255, 255, 0.14);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow: hidden;
+      background: radial-gradient(circle at 20% 15%, #1a3340 0, transparent 32rem), var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    #scene { position: fixed; inset: 0; }
+
+    .panel {
+      position: fixed;
+      left: 20px;
+      top: 20px;
+      width: min(520px, calc(100vw - 40px));
+      max-height: calc(100vh - 40px);
+      overflow: auto;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--panel);
+      backdrop-filter: blur(12px);
+      box-shadow: 0 20px 80px rgba(0, 0, 0, 0.35);
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      letter-spacing: -0.02em;
+    }
+
+    .meta {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+    }
+
+    .status-line {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin: 12px 0;
+      font-weight: 650;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--muted);
+      box-shadow: 0 0 20px currentColor;
+    }
+
+    .ok { color: var(--ok); }
+    .error { color: var(--error); }
+
+    pre {
+      display: none;
+      max-height: 280px;
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.32);
+      color: #ffd7d7;
+      white-space: pre-wrap;
+    }
+
+    .hint {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene"></canvas>
+  <section class="panel" aria-live="polite">
+    <h1>ChatGPT Icon 3D Preview</h1>
+    <div class="meta">
+      <span id="version">version: —</span>
+      <span id="build-time">last build: —</span>
+      <span id="command">command: —</span>
+      <span id="similarity">similarity: reference image not configured</span>
+    </div>
+    <div id="status" class="status-line">
+      <span class="dot"></span>
+      <span>Waiting for build status…</span>
+    </div>
+    <pre id="output"></pre>
+    <div class="hint">Drag to rotate, scroll or pinch to zoom. The preview loads separate base and logo STLs so the colours match a multi-part print.</div>
+  </section>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+
+    const canvas = document.querySelector('#scene');
+    const statusEl = document.querySelector('#status');
+    const outputEl = document.querySelector('#output');
+    const versionEl = document.querySelector('#version');
+    const buildTimeEl = document.querySelector('#build-time');
+    const commandEl = document.querySelector('#command');
+    const similarityEl = document.querySelector('#similarity');
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+    camera.position.set(0, -115, 82);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.target.set(0, 0, 2);
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x26303a, 2.4));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
+    keyLight.position.set(50, -80, 90);
+    scene.add(keyLight);
+    const fillLight = new THREE.DirectionalLight(0x8ee8d2, 1.0);
+    fillLight.position.set(-70, 50, 55);
+    scene.add(fillLight);
+
+    const grid = new THREE.GridHelper(110, 22, 0x2d3f4c, 0x20303a);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = -0.2;
+    scene.add(grid);
+
+    const loader = new STLLoader();
+    const baseMaterial = new THREE.MeshStandardMaterial({
+      color: 0xd8d6cf,
+      roughness: 0.62,
+      metalness: 0.02,
+    });
+    const logoMaterial = new THREE.MeshStandardMaterial({
+      color: 0x0b0f14,
+      roughness: 0.44,
+      metalness: 0.03,
+    });
+    let modelGroup = null;
+    let currentVersion = null;
+
+    function setStatus(ok, text) {
+      statusEl.className = `status-line ${ok ? 'ok' : 'error'}`;
+      statusEl.querySelector('span:last-child').textContent = text;
+    }
+
+    function showOutput(status, extra = '') {
+      const text = [extra, status?.stderr, status?.stdout].filter(Boolean).join('\n\n');
+      outputEl.textContent = text;
+      outputEl.style.display = text && (!status?.ok || extra) ? 'block' : 'none';
+    }
+
+    function updateSimilarity(status) {
+      const similarity = status.similarity || {};
+      if (!similarity.available) {
+        similarityEl.textContent = `similarity: not checked (${similarity.reason || 'reference missing'})`;
+        return;
+      }
+      if (similarity.error) {
+        similarityEl.textContent = `similarity: error — ${similarity.error}`;
+        return;
+      }
+      const score = Number(similarity.score || 0);
+      const target = Number(similarity.target || 0);
+      const verdict = similarity.ok ? 'PASS' : 'needs tuning';
+      similarityEl.textContent = `similarity: ${score.toFixed(3)} / target ${target.toFixed(2)} — ${verdict}`;
+    }
+
+    function frameObject(object) {
+      const box = new THREE.Box3().setFromObject(object);
+      const center = new THREE.Vector3();
+      const size = new THREE.Vector3();
+      box.getCenter(center);
+      box.getSize(size);
+      object.position.sub(new THREE.Vector3(center.x, center.y, box.min.z));
+
+      const maxDim = Math.max(size.x, size.y, size.z);
+      camera.position.set(0, -maxDim * 1.45, maxDim * 1.05);
+      camera.near = Math.max(maxDim / 1000, 0.01);
+      camera.far = maxDim * 20;
+      camera.updateProjectionMatrix();
+      controls.target.set(0, 0, size.z / 2);
+      controls.update();
+    }
+
+    function disposeGroup(group) {
+      if (!group) return;
+      scene.remove(group);
+      group.traverse((child) => {
+        if (child.isMesh) child.geometry.dispose();
+      });
+    }
+
+    function loadGeometry(path, version) {
+      return new Promise((resolve, reject) => {
+        loader.load(`${path}?v=${encodeURIComponent(version)}`, (geometry) => {
+          geometry.computeVertexNormals();
+          resolve(geometry);
+        }, undefined, reject);
+      });
+    }
+
+    async function loadStls(version, status) {
+      try {
+        const [baseGeometry, logoGeometry] = await Promise.all([
+          loadGeometry('/exports/chatgpt_icon_base.stl', version),
+          loadGeometry('/exports/chatgpt_icon_logo.stl', version),
+        ]);
+        const group = new THREE.Group();
+        group.name = 'split-colour ChatGPT icon preview';
+        const baseMesh = new THREE.Mesh(baseGeometry, baseMaterial);
+        baseMesh.name = 'base STL';
+        const logoMesh = new THREE.Mesh(logoGeometry, logoMaterial);
+        logoMesh.name = 'logo STL';
+        group.add(baseMesh, logoMesh);
+        frameObject(group);
+        disposeGroup(modelGroup);
+        modelGroup = group;
+        scene.add(modelGroup);
+      } catch (error) {
+        const message = `Could not load split STL preview: ${error.message || error}`;
+        setStatus(false, message);
+        showOutput(status, message);
+      }
+    }
+
+    async function pollStatus() {
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        const status = await response.json();
+        versionEl.textContent = `version: ${status.version}`;
+        buildTimeEl.textContent = `last build: ${status.last_build_time || '—'}`;
+        commandEl.textContent = `command: ${(status.command || []).join(' ') || '—'}`;
+        updateSimilarity(status);
+        showOutput(status);
+
+        if (status.ok) {
+          setStatus(true, status.building ? 'Build succeeded; watching for changes…' : 'Build succeeded');
+          if (
+            status.version !== currentVersion
+            && status.exports?.['chatgpt_icon_base.stl']
+            && status.exports?.['chatgpt_icon_logo.stl']
+          ) {
+            currentVersion = status.version;
+            loadStls(status.version, status);
+          }
+        } else {
+          setStatus(false, status.building ? 'Build running…' : `Build failed${status.returncode === null ? '' : ` (${status.returncode})`}`);
+        }
+      } catch (error) {
+        setStatus(false, `Status request failed: ${error.message}`);
+      }
+    }
+
+    function animate() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    pollStatus();
+    setInterval(pollStatus, 1500);
+    animate();
+  </script>
+</body>
+</html>
