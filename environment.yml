@@ -4,5 +4,6 @@ channels:
 dependencies:
   - python=3.11
   - cadquery
+  - numpy
   - pillow
   - shapely

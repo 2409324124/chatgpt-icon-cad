@@ -102,6 +102,44 @@ def _edge_mask(mask, image_modules: tuple[Any, Any, Any, Any]):
     return ImageChops.subtract(mask, eroded)
 
 
+def _vector_quality_scores(mask, image_modules: tuple[Any, Any, Any, Any]) -> tuple[float, float]:
+    """Measure edge quality of a binary mask: straightness and curvature smoothness.
+
+    Returns (straightness_score, curvature_score), each in [0, 1] where 1 is best.
+
+    straightness_score: ratio of the perimeter after morphological smoothing to
+        the original perimeter.  Smooth edges change little (≈ 1.0); jagged
+        pixel stair-steps get smoothed away, reducing the perimeter (< 1.0).
+
+    curvature_score: IoU between the original mask and its morphologically
+        smoothed version.  High IoU means edges were already smooth; low IoU
+        means smoothing significantly altered the silhouette.
+    """
+    Image, ImageChops, _ImageDraw, _ImageOps = image_modules
+    from PIL import ImageFilter
+
+    # Simulate vector cleanup: morphological close-then-open.
+    # Close (dilate then erode): fills gaps, smooths stair-steps.
+    smoothed = mask.filter(ImageFilter.MaxFilter(size=3))
+    smoothed = smoothed.filter(ImageFilter.MinFilter(size=3))
+    # Open (erode then dilate): removes thin protrusions.
+    smoothed = smoothed.filter(ImageFilter.MinFilter(size=3))
+    smoothed = smoothed.filter(ImageFilter.MaxFilter(size=3))
+
+    # straightness_score: perimeter ratio (smoothed / original).
+    orig_edge = _edge_mask(mask, image_modules)
+    smooth_edge = _edge_mask(smoothed, image_modules)
+    orig_perim = _count(orig_edge)
+    smooth_perim = _count(smooth_edge)
+    straightness_score = min(1.0, smooth_perim / orig_perim) if orig_perim > 0 else 1.0
+
+    # curvature_score: shape IoU after smoothing.
+    inter, union = _intersection_union(mask, smoothed, image_modules)
+    curvature_score = inter / union if union > 0 else 0.0
+
+    return straightness_score, curvature_score
+
+
 def compare(candidate: Path, reference: Path, size: int = DEFAULT_SIZE, target: float = DEFAULT_TARGET_SCORE) -> dict[str, Any]:
     if not candidate.is_file():
         raise FileNotFoundError(f"Candidate preview not found: {candidate}")
@@ -126,17 +164,27 @@ def compare(candidate: Path, reference: Path, size: int = DEFAULT_SIZE, target: 
     edge_inter, edge_union = _intersection_union(cand_edge, ref_edge, image_modules)
     edge_iou = edge_inter / edge_union if edge_union else 0.0
 
-    # Weighted for rough CAD iteration: IoU dominates, area/edge keep scale and
-    # silhouette detail honest.  "Basic close" is intentionally lower than exact
-    # logo matching because this model is a printable approximation.
-    score = 0.62 * iou + 0.23 * area_ratio + 0.15 * edge_iou
+    # Shape sub-score (internal weights sum to 1.0 within the shape group).
+    shape_score = 0.62 * iou + 0.23 * area_ratio + 0.15 * edge_iou
+
+    # Vector quality: measures how clean the candidate's edges are — straight
+    # lines stay straight, round corners stay round, pixel stair-steps are gone.
+    straightness_score, curvature_score = _vector_quality_scores(candidate_mask, image_modules)
+    vector_quality_score = 0.5 * straightness_score + 0.5 * curvature_score
+
+    # Final score: shape (82 %) + vector quality (18 %) = 1.0.
+    score = 0.82 * shape_score + 0.18 * vector_quality_score
     return {
         "ok": score >= target,
         "score": round(score, 4),
         "target": target,
+        "shape_score": round(shape_score, 4),
+        "vector_quality_score": round(vector_quality_score, 4),
         "iou": round(iou, 4),
         "area_ratio": round(area_ratio, 4),
         "edge_iou": round(edge_iou, 4),
+        "straightness_score": round(straightness_score, 4),
+        "curvature_score": round(curvature_score, 4),
         "candidate_area_px": candidate_area,
         "reference_area_px": reference_area,
         "candidate": str(candidate),

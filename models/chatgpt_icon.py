@@ -19,7 +19,10 @@ from pathlib import Path
 # =============================================================================
 
 # Base disk
-BASE_DIAMETER = 80.0
+# BASE_DIAMETER is now computed dynamically from the logo bounding box plus
+# BASE_MARGIN_PER_SIDE on each side.  This keeps the base snug around the logo
+# instead of using an oversized fixed 80 mm disk.
+BASE_MARGIN_PER_SIDE = 1.5
 BASE_THICKNESS = 3.0
 BASE_EDGE_FILLET = 0.8
 
@@ -37,16 +40,22 @@ SINGLE_UNION_OVERLAP = 0.02
 TRACE_REFERENCE_LOGO = True
 REFERENCE_LOGO_PATH = "reference/chatgpt_reference.png"
 TRACE_LOGO_DIAMETER = 56.0
-TRACE_RESOLUTION = 288
-TRACE_SIMPLIFY = 0.18
+TRACE_RESOLUTION = 384
+TRACE_SIMPLIFY = 0.12
 TRACE_THRESHOLD = 190
 # CAD cleanup for bitmap trace mode.  The reference image is still sampled as a
 # binary mask, but contiguous runs are unioned and then cleaned into CAD-friendly
 # contours so exported logo edges do not keep the original pixel stair steps.
-TRACE_CLOSE_BUFFER = 0.12
-TRACE_OPEN_BUFFER = 0.045
-TRACE_MIN_POLYGON_AREA = 0.35
-TRACE_PREVIEW_SUPERSAMPLE = 3
+# TRACE_CLOSE_BUFFER: morphological close (dilate + erode) fills small gaps and
+#   smooths pixel stair-steps; higher values produce rounder corners.
+# TRACE_OPEN_BUFFER: morphological open (erode + dilate) removes thin
+#   protrusions and noise; higher values produce straighter clean edges.
+# TRACE_MIN_POLYGON_AREA: discard any polygon fragment smaller than this (mm²)
+#   after cleanup to remove leftover speckles.
+TRACE_CLOSE_BUFFER = 0.18
+TRACE_OPEN_BUFFER = 0.07
+TRACE_MIN_POLYGON_AREA = 0.50
+
 
 # Six rounded folded bands.  Each lobe is made from short rounded capsules
 # joined into a bent hook/chevron, then repeated every 60 degrees.  This is a
@@ -75,7 +84,6 @@ CENTER_VOID_HEX_FLAT_DIAMETER = 8.0
 # Printability guards
 MIN_LINE_WIDTH = 0.8
 MIN_GAP = 0.5
-LOGO_OUTER_CLEARANCE_FROM_BASE_EDGE = 5.0
 
 # Export names
 EXPORT_DIR_NAME = "exports"
@@ -121,11 +129,16 @@ def _project_root() -> Path:
 
 
 def validate_parameters() -> None:
-    """Fail early with clear messages for impossible or hard-to-print geometry."""
+    """Fail early with clear messages for impossible or hard-to-print geometry.
+
+    Checks that do not depend on the final base diameter are validated here.
+    Geometry-dependent checks (logo vs base clearance) are deferred to
+    ``validate_geometry`` which runs after the logo and base are computed.
+    """
     errors: list[str] = []
 
-    if BASE_DIAMETER <= 0:
-        errors.append("BASE_DIAMETER must be greater than 0")
+    if BASE_MARGIN_PER_SIDE < 0:
+        errors.append("BASE_MARGIN_PER_SIDE cannot be negative")
     if BASE_THICKNESS <= 0:
         errors.append("BASE_THICKNESS must be greater than 0")
     if LOGO_HEIGHT <= 0:
@@ -157,16 +170,6 @@ def validate_parameters() -> None:
             errors.append("TRACE_REFERENCE_LOGO requires Pillow and Shapely")
         if TRACE_LOGO_DIAMETER <= 0:
             errors.append("TRACE_LOGO_DIAMETER must be greater than 0")
-        if TRACE_LOGO_DIAMETER / 2 > BASE_DIAMETER / 2 - LOGO_OUTER_CLEARANCE_FROM_BASE_EDGE:
-            errors.append("TRACE_LOGO_DIAMETER is too large for the base clearance")
-
-    logo_outer_radius = max(math.hypot(x, y) for x, y in PETAL_PATH_POINTS) + PETAL_WIDTH / 2
-    max_logo_radius = BASE_DIAMETER / 2 - LOGO_OUTER_CLEARANCE_FROM_BASE_EDGE
-    if logo_outer_radius > max_logo_radius:
-        errors.append(
-            "Logo may extend too close to or beyond the base edge: "
-            f"outer radius {logo_outer_radius:.2f} mm, allowed {max_logo_radius:.2f} mm"
-        )
 
     centre_void_width = CENTER_VOID_HEX_FLAT_DIAMETER if CENTER_VOID_SHAPE == "hexagon" else CENTER_VOID_DIAMETER
     min_point_radius = min(math.hypot(x, y) for x, y in PETAL_PATH_POINTS)
@@ -181,9 +184,27 @@ def validate_parameters() -> None:
         raise ValueError("Parameter validation failed:\n- " + "\n- ".join(errors))
 
 
-def make_base() -> cq.Workplane:
+def validate_geometry(base_diameter: float, logo_bb_xlen: float, logo_bb_ylen: float) -> None:
+    """Geometry-dependent checks that run after logo and base are computed."""
+    errors: list[str] = []
+
+    if base_diameter <= 0:
+        errors.append("Computed base_diameter must be greater than 0")
+
+    logo_max_dim = max(logo_bb_xlen, logo_bb_ylen)
+    clearance = base_diameter - logo_max_dim
+    if clearance < 0:
+        errors.append(
+            f"Logo ({logo_max_dim:.2f} mm) extends beyond base ({base_diameter:.2f} mm)"
+        )
+
+    if errors:
+        raise ValueError("Geometry validation failed:\n- " + "\n- ".join(errors))
+
+
+def make_base(diameter: float) -> cq.Workplane:
     """Create the round base disk with a small top/bottom edge fillet."""
-    base = cq.Workplane("XY").circle(BASE_DIAMETER / 2).extrude(BASE_THICKNESS)
+    base = cq.Workplane("XY").circle(diameter / 2).extrude(BASE_THICKNESS)
     if BASE_EDGE_FILLET > 0:
         # A cylinder's printable round-over edges are the circular top and bottom
         # perimeter edges.  ``|Z`` selects the cylinder seam edge, which CadQuery
@@ -278,7 +299,12 @@ def _polygon_to_workplane(poly: Polygon) -> cq.Workplane | None:  # type: ignore
 
 
 def make_traced_reference_logo() -> cq.Workplane:
-    """Vectorise the supplied reference PNG into a printable raised logo."""
+    """Vectorise the supplied reference PNG into a printable raised logo.
+
+    The pipeline applies proper morphological cleanup using the TRACE_*_BUFFER
+    parameters so that pixel stair-steps are smoothed into rounder corners and
+    straighter edges before CadQuery extrusion.
+    """
     if box is None or unary_union is None or Polygon is None or MultiPolygon is None:
         raise RuntimeError("Shapely is required for TRACE_REFERENCE_LOGO")
     mask, width, height = _reference_logo_mask()
@@ -286,6 +312,7 @@ def make_traced_reference_logo() -> cq.Workplane:
     min_x = -width * pixel / 2
     max_y = height * pixel / 2
 
+    # 1. Build per-pixel boxes and union them.
     cells = []
     for y, row in enumerate(mask):
         for x, filled in enumerate(row):
@@ -296,8 +323,39 @@ def make_traced_reference_logo() -> cq.Workplane:
             cells.append(box(x0, y1 - pixel, x0 + pixel, y1))
     if not cells:
         raise ValueError("Reference trace produced no foreground cells")
+    geometry = unary_union(cells)
 
-    geometry = unary_union(cells).buffer(pixel * 0.45).buffer(-pixel * 0.45).simplify(TRACE_SIMPLIFY, preserve_topology=True)
+    # 2. Morphological close (dilate then erode): fills tiny gaps between
+    #    adjacent pixel blobs and smooths stair-step edges into rounder corners.
+    if TRACE_CLOSE_BUFFER > 0:
+        geometry = geometry.buffer(TRACE_CLOSE_BUFFER).buffer(-TRACE_CLOSE_BUFFER)
+
+    # 3. Morphological open (erode then dilate): removes thin protrusions and
+    #    isolated pixel noise, producing cleaner straight edges.
+    if TRACE_OPEN_BUFFER > 0:
+        geometry = geometry.buffer(-TRACE_OPEN_BUFFER).buffer(TRACE_OPEN_BUFFER)
+
+    # 4. Discard tiny polygon fragments that survived cleanup.
+    if isinstance(geometry, MultiPolygon):
+        polys = [p for p in geometry.geoms if p.area >= TRACE_MIN_POLYGON_AREA]
+        if not polys:
+            raise RuntimeError(
+                f"All polygons smaller than TRACE_MIN_POLYGON_AREA ({TRACE_MIN_POLYGON_AREA} mm²)"
+            )
+        geometry = MultiPolygon(polys) if len(polys) > 1 else polys[0]
+    elif geometry.area < TRACE_MIN_POLYGON_AREA:
+        raise RuntimeError(
+            f"Single polygon too small after TRACE_MIN_POLYGON_AREA filter ({TRACE_MIN_POLYGON_AREA} mm²)"
+        )
+
+    # 5. Simplify to reduce vertex count while preserving topology.  A lower
+    #    tolerance keeps curves rounder (less aggressive corner-cutting).
+    geometry = geometry.simplify(TRACE_SIMPLIFY, preserve_topology=True)
+
+    # 6. Buffer(0) cleans up any self-intersections introduced by simplify.
+    geometry = geometry.buffer(0)
+
+    # 7. Convert to CadQuery extruded solids.
     polygons = list(geometry.geoms) if isinstance(geometry, MultiPolygon) else [geometry]
     logo: cq.Workplane | None = None
     for poly in polygons:
@@ -354,10 +412,26 @@ def make_logo() -> cq.Workplane:
     return logo.cut(make_center_void())
 
 
-def make_models() -> tuple[cq.Workplane, cq.Workplane, cq.Workplane, cq.Compound]:
-    """Build base, separate logo, single-piece union, and reporting compound."""
-    base = make_base()
+def make_models() -> tuple[cq.Workplane, cq.Workplane, cq.Workplane, cq.Compound, float]:
+    """Build base, separate logo, single-piece union, and reporting compound.
+
+    Returns (base, logo, single, reporting_compound, base_diameter).
+    The base diameter is computed from the logo bounding box + margin.
+    """
+    # 1. Build logo first so we can measure its bounding box.
     logo = make_logo()
+    logo_bb = logo.val().BoundingBox()
+    logo_max_dim = max(logo_bb.xlen, logo_bb.ylen)
+
+    # 2. Compute base diameter: logo max dimension + margin on each side.
+    base_diameter = logo_max_dim + 2 * BASE_MARGIN_PER_SIDE
+
+    # 3. Geometry-dependent validation (logo vs base clearance).
+    validate_geometry(base_diameter, logo_bb.xlen, logo_bb.ylen)
+
+    # 4. Build base with computed diameter.
+    base = make_base(base_diameter)
+
     # For the one-piece STL, slightly sink a copy of the logo so the solids
     # overlap and CadQuery produces a true merged manifold instead of two solids
     # that merely touch at z=BASE_THICKNESS.  The top height stays effectively
@@ -365,10 +439,10 @@ def make_models() -> tuple[cq.Workplane, cq.Workplane, cq.Workplane, cq.Compound
     single_logo = logo.translate((0, 0, -SINGLE_UNION_OVERLAP))
     single = base.union(single_logo)
     reporting_compound = cq.Compound.makeCompound([base.val(), logo.val()])
-    return base, logo, single, reporting_compound
+    return base, logo, single, reporting_compound, base_diameter
 
 
-def export_models(base: cq.Workplane, logo: cq.Workplane, single: cq.Workplane) -> dict[str, Path]:
+def export_models(base: cq.Workplane, logo: cq.Workplane, single: cq.Workplane, base_diameter: float) -> dict[str, Path]:
     """Export all requested files, preserving shared coordinates for multi-colour import."""
     export_dir = _project_root() / EXPORT_DIR_NAME
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -390,7 +464,7 @@ def export_models(base: cq.Workplane, logo: cq.Workplane, single: cq.Workplane) 
 
     exporters.export(base, str(paths["base_stl"]))
     exporters.export(logo, str(paths["logo_stl"]))
-    export_preview_png(paths["preview_png"])
+    export_preview_png(paths["preview_png"], base_diameter)
     return paths
 
 
@@ -450,13 +524,13 @@ def _inside_center_void(x: float, y: float) -> bool:
     return x * x + y * y <= (CENTER_VOID_DIAMETER / 2) ** 2
 
 
-def export_preview_png(path: Path) -> None:
-    """Write a dependency-free top-view PNG preview of the parametric footprint."""
+def export_preview_png(path: Path, base_diameter: float) -> None:
+    """Write a dependency-free top-view preview of the parametric footprint."""
     size = 900
     margin_px = 48
-    scale = (size - 2 * margin_px) / BASE_DIAMETER
+    scale = (size - 2 * margin_px) / base_diameter
     half = size / 2
-    base_radius = BASE_DIAMETER / 2
+    base_radius = base_diameter / 2
 
     bg = (250, 250, 247, 255)
     base_colour = (226, 226, 220, 255)
@@ -507,10 +581,20 @@ def export_preview_png(path: Path) -> None:
     _write_rgba_png(path, size, size, bytes(pixels))
 
 
-def print_report(single: cq.Workplane, reporting_compound: cq.Compound, paths: dict[str, Path]) -> None:
+def print_report(
+    single: cq.Workplane,
+    logo: cq.Workplane,
+    reporting_compound: cq.Compound,
+    paths: dict[str, Path],
+    base_diameter: float,
+) -> None:
     bbox = reporting_compound.BoundingBox()
     solid_count = len(reporting_compound.Solids())
     single_solid_count = len(single.val().Solids())
+
+    logo_bb = logo.val().BoundingBox()
+    logo_max_dim = max(logo_bb.xlen, logo_bb.ylen)
+    clearance = base_diameter - logo_max_dim
 
     print("ChatGPT-style icon generated successfully")
     print(
@@ -518,7 +602,10 @@ def print_report(single: cq.Workplane, reporting_compound: cq.Compound, paths: d
         f"X={bbox.xlen:.3f}, Y={bbox.ylen:.3f}, Z={bbox.zlen:.3f}"
     )
     print(f"Maximum height (mm): {bbox.zmax:.3f}")
-    print(f"Base diameter (mm): {BASE_DIAMETER:.3f}")
+    print(f"Base diameter (mm): {base_diameter:.3f}")
+    print(f"Logo bounding box (mm): X={logo_bb.xlen:.3f}, Y={logo_bb.ylen:.3f}")
+    print(f"Logo max dimension (mm): {logo_max_dim:.3f}")
+    print(f"Base-logo clearance (mm): {clearance:.3f} ({clearance/2:.1f} per side)")
     print(f"Logo height (mm): {LOGO_HEIGHT:.3f}")
     print(f"Solid count (base + separate logo): {solid_count}")
     print(f"Single-colour merged solid count: {single_solid_count}")
@@ -530,9 +617,9 @@ def print_report(single: cq.Workplane, reporting_compound: cq.Compound, paths: d
 def main() -> int:
     try:
         validate_parameters()
-        base, logo, single, reporting_compound = make_models()
-        paths = export_models(base, logo, single)
-        print_report(single, reporting_compound, paths)
+        base, logo, single, reporting_compound, base_diameter = make_models()
+        paths = export_models(base, logo, single, base_diameter)
+        print_report(single, logo, reporting_compound, paths, base_diameter)
         return 0
     except Exception as exc:
         print(f"ERROR: Failed to generate ChatGPT-style icon: {exc}", file=sys.stderr)

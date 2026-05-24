@@ -1,6 +1,6 @@
 # ChatGPT-style 3D Icon
 
-Parametric CadQuery model for a small printable ChatGPT-style icon: an 80 mm round base with a raised six-part folded-band logo and clear central hexagon negative space.
+Parametric CadQuery model for a small printable ChatGPT-style icon: a round base with a raised six-part folded-band logo and clear central hexagon negative space.  The base diameter is computed automatically from the logo bounding box plus a configurable margin per side, so the base stays snug around the logo.
 
 ## Install dependencies
 
@@ -74,7 +74,12 @@ The comparison uses `exports/preview.png` as the generated top-view screenshot a
 exports/similarity_report.json
 ```
 
-It prints a score made from silhouette IoU, area ratio, and edge IoU. The default “basic close” target is `0.72`:
+It prints a composite score built from two groups:
+
+- **Shape (82 %):** silhouette IoU, area ratio, edge IoU — how closely the generated silhouette matches the reference.
+- **Vector quality (18 %):** `straightness_score` (perimeter stability after morphological smoothing) and `curvature_score` (shape IoU after morphological smoothing) — how clean the edges are: straight lines stay straight, round corners stay round, pixel stair-steps are suppressed.
+
+The `similarity_report.json` includes all sub-metrics: `shape_score`, `vector_quality_score`, `straightness_score`, `curvature_score`, and the weighted `score`. The default “basic close” target is `0.72`:
 
 ```bash
 python tools/compare_top_view.py --target 0.72
@@ -86,14 +91,22 @@ When `tools/serve_preview.py` is running, it automatically performs this check a
 
 Edit the parameter area at the top of `models/chatgpt_icon.py`:
 
-- `BASE_DIAMETER = 80.0`
+- `BASE_MARGIN_PER_SIDE = 1.5` — margin (mm) between the logo edge and the base edge on each side
 - `BASE_THICKNESS = 3.0`
 - `BASE_EDGE_FILLET = 0.8`
 - `LOGO_HEIGHT = 1.2`
 - `PETAL_WIDTH`, `PETAL_PATH_POINTS`, `PETAL_START_ANGLE`
 - `CENTER_VOID_SHAPE`, `CENTER_VOID_DIAMETER`, `CENTER_VOID_HEX_FLAT_DIAMETER`
 
-The script validates basic printability constraints: minimum line width is at least `0.8 mm`, central gap is at least `0.5 mm`, and the logo stays inside the base edge clearance.
+When `TRACE_REFERENCE_LOGO = True`, additional parameters control the bitmap-to-vector cleanup pipeline:
+
+- `TRACE_RESOLUTION = 384` — rasterisation grid size; higher = finer detail but slower
+- `TRACE_CLOSE_BUFFER = 0.18` — morphological close (dilate + erode) fills gaps and rounds corners
+- `TRACE_OPEN_BUFFER = 0.07` — morphological open (erode + dilate) removes thin noise
+- `TRACE_MIN_POLYGON_AREA = 0.50` — discard polygon fragments smaller than this (mm²)
+- `TRACE_SIMPLIFY = 0.12` — Douglas-Peucker simplification tolerance; lower = rounder curves
+
+The script validates basic printability constraints: minimum line width is at least `0.8 mm`, central gap is at least `0.5 mm`, and the base encloses the logo with at least `BASE_MARGIN_PER_SIDE` clearance on each edge.
 
 ## Import into Bambu Studio
 
@@ -117,4 +130,4 @@ The STEP file is also available if your CAD/slicer workflow prefers assemblies.
 - Make strokes thicker/thinner: change `PETAL_WIDTH`; keep it `>= 0.8` for printability.
 - Rotate the pattern: change `PETAL_START_ANGLE`.
 - Change the centre opening: use `CENTER_VOID_SHAPE = "circle"` or `"hexagon"`, then adjust the matching diameter.
-- Keep the logo within the base: leave `LOGO_OUTER_CLEARANCE_FROM_BASE_EDGE` at `5.0` or increase it for more margin.
+- Keep the logo within the base: the base diameter is computed automatically as the logo max dimension + `2 * BASE_MARGIN_PER_SIDE`.  Increase `BASE_MARGIN_PER_SIDE` for more margin around the logo.

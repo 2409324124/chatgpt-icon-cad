@@ -27,7 +27,10 @@ REFERENCE = PROJECT_ROOT / "reference" / "chatgpt_reference.png"
 REPORT = PROJECT_ROOT / "exports" / "param_search_report.json"
 
 SIZE = 180
-BASE_DIAMETER = 80.0
+# Search grid viewport diameter in mm.  This controls the coordinate space for
+# the fast silhouette scorer and is NOT the model base diameter (which is now
+# computed dynamically from the logo bounding box + margin).
+LOGO_VIEWPORT_DIAMETER = 80.0
 MARGIN = 18
 
 REF: np.ndarray
@@ -59,6 +62,64 @@ def _edge(mask: np.ndarray) -> np.ndarray:
             shifted[:, -1] = False
         eroded &= shifted
     return mask & ~eroded
+
+
+def _morph_op(mask: np.ndarray, op: str) -> np.ndarray:
+    """Morphological erode (op='&') or dilate (op='|') with 8-connected kernel."""
+    result = mask.copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            shifted = np.roll(mask, (dy, dx), axis=(0, 1))
+            if dy == 1:
+                shifted[0, :] = False
+            elif dy == -1:
+                shifted[-1, :] = False
+            if dx == 1:
+                shifted[:, 0] = False
+            elif dx == -1:
+                shifted[:, -1] = False
+            if op == '&':
+                result &= shifted
+            else:
+                result |= shifted
+    return result
+
+
+def _vector_quality_np(mask: np.ndarray) -> tuple[float, float]:
+    """Numpy-based vector quality: straightness and curvature.
+
+    Returns (straightness_score, curvature_score), matching the semantics of
+    compare_top_view._vector_quality_scores:
+
+    - straightness_score: perimeter ratio (smoothed / original).  Smooth edges
+      change little (≈ 1.0); jagged pixel stair-steps get smoothed away,
+      reducing the perimeter (< 1.0).
+    - curvature_score: IoU between original and smoothed mask.  High IoU means
+      edges were already smooth; low IoU means smoothing significantly altered
+      the silhouette.
+
+    Uses 8-connected morphological close-then-open as a proxy for vector cleanup.
+    """
+    # Close (dilate then erode): fills gaps, smooths stair-steps.
+    closed = _morph_op(_morph_op(mask, '|'), '&')
+    # Open (erode then dilate): removes thin protrusions.
+    smoothed = _morph_op(_morph_op(closed, '&'), '|')
+
+    # straightness_score: perimeter ratio (smoothed / original).
+    edge_orig = _edge(mask)
+    edge_smooth = _edge(smoothed)
+    orig_perim = int(edge_orig.sum())
+    smooth_perim = int(edge_smooth.sum())
+    straightness = float(min(1.0, smooth_perim / orig_perim)) if orig_perim > 0 else 1.0
+
+    # curvature_score: IoU between original and smoothed mask.
+    inter = np.logical_and(mask, smoothed).sum()
+    union = np.logical_or(mask, smoothed).sum()
+    curvature = float(inter / union) if union else 0.0
+
+    return straightness, curvature
 
 
 def _segment_mask(lx: np.ndarray, ly: np.ndarray, start: tuple[float, float], end: tuple[float, float], width: float) -> np.ndarray:
@@ -113,12 +174,25 @@ def _score_mask(mask: np.ndarray) -> dict[str, float | int]:
     edge_inter = np.logical_and(edge, ref_edge).sum()
     edge_union = np.logical_or(edge, ref_edge).sum()
     edge_iou = edge_inter / edge_union if edge_union else 0.0
-    score = 0.62 * iou + 0.23 * area_ratio + 0.15 * edge_iou
+
+    # Shape sub-score (weights sum to 1.0 within the shape group).
+    shape_score = 0.62 * iou + 0.23 * area_ratio + 0.15 * edge_iou
+
+    # Vector quality: straightness + curvature.
+    straightness, curvature = _vector_quality_np(mask)
+    vector_quality_score = 0.5 * straightness + 0.5 * curvature
+
+    # Final score: shape (82 %) + vector quality (18 %) = 1.0.
+    score = 0.82 * shape_score + 0.18 * vector_quality_score
     return {
         "score": float(score),
+        "shape_score": float(shape_score),
+        "vector_quality_score": float(vector_quality_score),
         "iou": float(iou),
         "area_ratio": float(area_ratio),
         "edge_iou": float(edge_iou),
+        "straightness_score": float(straightness),
+        "curvature_score": float(curvature),
         "area": area,
     }
 
@@ -126,7 +200,9 @@ def _score_mask(mask: np.ndarray) -> dict[str, float | int]:
 def _valid(points: list[tuple[float, float]], width: float) -> bool:
     if width < 0.8:
         return False
-    if max(math.hypot(x, y) for x, y in points) + width / 2 > 34.5:
+    # Keep the logo within the search grid viewport.
+    max_allowed_radius = LOGO_VIEWPORT_DIAMETER / 2 - 5.5
+    if max(math.hypot(x, y) for x, y in points) + width / 2 > max_allowed_radius:
         return False
     for a, b in zip(points, points[1:]):
         if math.dist(a, b) <= width * 1.15:
@@ -175,7 +251,7 @@ def _init_globals() -> None:
     modules = compare._load_pillow()
     REF = np.array(compare._reference_logo_mask(REFERENCE, SIZE, modules)) > 0
     yy, xx = np.mgrid[0:SIZE, 0:SIZE]
-    scale = (SIZE - 2 * MARGIN) / BASE_DIAMETER
+    scale = (SIZE - 2 * MARGIN) / LOGO_VIEWPORT_DIAMETER
     half = SIZE / 2
     X = ((xx + 0.5) - half) / scale
     Y = (half - (yy + 0.5)) / scale
@@ -208,8 +284,10 @@ def main() -> int:
     for idx, item in enumerate(top[:8], 1):
         pts = ", ".join(f"({x:.2f}, {y:.2f})" for x, y in item["points"])
         print(
-            f"#{idx} score={item['score']:.4f} iou={item['iou']:.4f} "
-            f"area={item['area_ratio']:.4f} edge={item['edge_iou']:.4f} "
+            f"#{idx} score={item['score']:.4f} shape={item['shape_score']:.4f} "
+            f"vq={item['vector_quality_score']:.4f} "
+            f"iou={item['iou']:.4f} area={item['area_ratio']:.4f} edge={item['edge_iou']:.4f} "
+            f"straight={item['straightness_score']:.4f} curve={item['curvature_score']:.4f} "
             f"width={item['width']:.2f} angle={item['angle']:.2f} void={item['void']:.2f}"
         )
         print(f"   points=({pts})")
